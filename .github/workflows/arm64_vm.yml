@@ -189,6 +189,15 @@ jobs:
             tail -100 ~/emulator.log
             exit 1
           fi
+          # Fail fast on KVM — don't let -accel auto silently fall back to
+          # TCG (software emulation), which is too slow to boot Android in
+          # the 10-minute boot timeout below.
+          if [ ! -w /dev/kvm ]; then
+            echo "ERROR: /dev/kvm is not writable — KVM acceleration unavailable."
+            echo "Cannot boot x86_64 Android emulator without KVM in under 10 min."
+            ls -la /dev/kvm 2>/dev/null || true
+            exit 1
+          fi
           echo "Waiting for device (up to 5 min)..."
           if ! timeout 300 adb wait-for-device; then
             echo "ERROR: adb wait-for-device timed out after 5 min"
@@ -250,7 +259,12 @@ jobs:
       - name: Install MCP server deps + generate token
         run: |
           cd $GITHUB_WORKSPACE
-          npm install --ignore-scripts
+          # NOTE: do NOT use --ignore-scripts — node-pty's prebuild-install
+          # postinstall is what fetches the linux-x64 prebuilt binary.
+          # Without it, dist/src/server.js will throw "Cannot find module node-pty".
+          npm install --no-audit --no-fund --loglevel=error
+          # Verify node-pty prebuilt loaded successfully
+          node -e "const pty=require('node-pty'); console.log('node-pty OK, version:', require('node-pty/package.json').version);"
           TOKEN=$(node 4f72e6a6.js .mcp-auth-token)
           if [ -z "$TOKEN" ]; then
             echo "ERROR: token generation failed"
@@ -258,7 +272,11 @@ jobs:
           fi
           echo "Token generated: ${#TOKEN} chars"
           echo "$TOKEN" > ~/mcp-token.txt
-          echo "::add-mask::$TOKEN"
+          # NOTE: we intentionally do NOT call ::add-mask::$TOKEN here.
+          # poll_workflow.py (on the agent side) extracts the token from this
+          # job's log via the regex r'Auth Token:\s*([a-f0-9]{64})'. Masking
+          # it would replace the token with '**' in the log and break polling.
+          # The repo is private; the token is single-session and expires with the VM.
 
       - name: Start MCP server + cloudflared tunnel
         run: |
@@ -324,7 +342,7 @@ jobs:
           adb shell "ps -A | grep frida"
           echo ""
           echo "First 10 frida-ps -U entries:"
-          frida-ps -U | head -10
+          timeout 15 frida-ps -U 2>&1 | head -10 || echo "(frida-ps timed out or failed)"
           echo ""
           echo "VM will stay alive for ${{ inputs.session_minutes }} minutes."
 
