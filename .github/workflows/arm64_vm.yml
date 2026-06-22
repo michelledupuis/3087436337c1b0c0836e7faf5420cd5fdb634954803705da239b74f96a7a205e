@@ -62,14 +62,13 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           cloudflared --version
 
-      - name: Cache Android SDK + AVD
+      - name: Cache Android SDK
         id: cache-sdk
         uses: actions/cache@v4
         with:
           path: |
             ~/android-sdk
-            ~/.android/avd
-          key: android-sdk-arm64-linux-api30-v1
+          key: android-sdk-arm64-linux-api30-v2
 
       - name: Install Android SDK + Emulator (arm64 system image)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
@@ -82,18 +81,36 @@ jobs:
           unzip -q cmdline-tools.zip
           mv cmdline-tools latest
           export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
           export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator"
-          yes | sdkmanager --licenses > /dev/null 2>&1
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install \
             "platform-tools" \
             "emulator" \
             "platforms;android-${ANDROID_API_LEVEL}" \
             "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
             "build-tools;${ANDROID_BUILD_TOOLS}"
+          echo "SDK install completed"
+
+      - name: Create AVD
+        run: |
+          set -e
+          export ANDROID_HOME="$HOME/android-sdk"
+          export ANDROID_SDK_ROOT="$HOME/android-sdk"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator"
+          echo "=== Available system images ==="
+          sdkmanager --list_installed | grep -E "system-images|platforms|build-tools" || true
+          echo "=== Creating AVD ==="
           echo "no" | avdmanager create avd \
             -n ${{ env.EMULATOR_NAME }} \
             -k "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
             -d pixel_5 --force
+          echo "=== AVD created. Listing AVDs: ==="
+          avdmanager list avd | head -30
+          echo "=== AVD .ini file location ==="
+          ls -la "$ANDROID_AVD_HOME/"
 
       - name: Add SDK to PATH
         run: |
@@ -102,6 +119,8 @@ jobs:
           echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
           echo "$HOME/android-sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
           echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
 
       - name: Install Python deps
         run: |
