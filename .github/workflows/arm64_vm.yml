@@ -1,21 +1,52 @@
-name: Android VM
+name: ARM64 Android VM (macOS-14 native)
+
+# =============================================================================
+# This workflow spins up a NATIVE ARM64 Android emulator on a GitHub Actions
+# macOS-14 (Apple Silicon M1) runner.
+#
+# WHY ARM64 NATIVE (not ubuntu x86_64):
+#   - All our prior RE artifacts are ARM64:
+#       * 1007 Ghidra decompiled functions
+#       * ecobank_libdp_decrypted.bin (573 KB valid ARM64 inner image)
+#       * ECO_RAW_VM_KEY = 9b4fab17...6a63 (proven, produces valid image)
+#       * precision_key_extract_arm64_frida17_v*.js (5 versions)
+#   - On ARM64 native, the linker64 is ARM64, so r_brk = 0xC0035FD6 (ARM64 RET).
+#     The DexProtector VM expects exactly this value. On x86_64, r_brk is
+#     0xE9B3B43B (JMP rel32) — wrong bytes -> VM produces wrong key -> init_status=500.
+#     This is the FUNDAMENTAL blocker on x86_64 that no amount of Frida hooking
+#     can fix (overwriting r_brk in linker causes #UD because 0xD6 is invalid
+#     in x86_64 long mode).
+#   - On macOS-14 ARM64, there is NO KVM hypervisor -> no CPUID "KVMKVMKVM"
+#     signature -> DexProtector's check 0x0d (hypervisor detection) PASSES.
+#   - Net result: VM produces correct ARM64 outer key -> DPLF decrypts -> inner
+#     libdp.so loads -> HMAC wrapper is hookable -> password captured ->
+#     master_key computed -> classes.ecobank.dat decrypted.
+# =============================================================================
 
 on:
   workflow_dispatch:
     inputs:
       session_minutes:
-        description: 'Session duration in minutes (max 330)'
+        description: 'Session duration in minutes (max 330, leaves 30min buffer for teardown)'
         required: true
         default: '240'
+      tunnel_token:
+        description: 'Cloudflared named-tunnel token (optional). Leave empty for ephemeral trycloudflare URL.'
+        required: false
+        default: ''
 
+# Hard cap: GitHub Actions macOS jobs max out at 6h = 360min.
+# We use 330 to leave buffer for teardown + artifact upload.
 jobs:
   arm64_vm:
-    runs-on: ubuntu-22.04
+    runs-on: macos-14
     timeout-minutes: 350
     env:
       ANDROID_API_LEVEL: 30
       ANDROID_BUILD_TOOLS: 30.0.3
-      EMULATOR_NAME: e
+      EMULATOR_NAME: ecobank_arm64
+      # Release tag holding ARM64 APK splits + Phantom Frida ARM64 binary
+      ARM64_ASSETS_TAG: v-arm64-transfer-1782140279
 
     steps:
       - name: Checkout
@@ -37,148 +68,79 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Linux deps (KVM, cloudflared, etc.)
+      - name: Install Cloudflared (via Homebrew)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            qemu-user-static \
-            bridge-utils \
-            libpulse0 \
-            libnss3 \
-            libxss1 \
-            libasound2 \
-            libgl1 \
-            libxshmfence1 \
-            cpu-checker \
-            android-tools-adb
-          # Grant KVM access to the runner user (GitHub Actions runners have /dev/kvm
-          # but the runner user is NOT in the kvm group by default).
-          sudo gpasswd -a $USER kvm || true
-          sudo chmod 666 /dev/kvm 2>/dev/null || true
-          # Verify KVM access
-          kvm-ok 2>/dev/null || echo "kvm-ok not available"
-          ls -la /dev/kvm 2>/dev/null || echo "(no /dev/kvm)"
-          # Install cloudflared
-          curl -L -o /tmp/cloudflared.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i /tmp/cloudflared.deb
+          brew install cloudflared
           cloudflared --version
 
-      - name: Cache Android SDK
+      # ---------------------------------------------------------------------------
+      # Cache the Android SDK + system image + AVD. First run ~10 min; cache hits ~30s.
+      # ---------------------------------------------------------------------------
+      - name: Cache Android SDK + AVD
         id: cache-sdk
         uses: actions/cache@v4
         with:
           path: |
-            ~/android-sdk
-          key: android-sdk-x86_64-linux-api30-v1
+            ~/Library/Android/sdk
+            ~/.android/avd
+          key: android-sdk-arm64-api30-googleapis-v5
 
-      - name: Install Android SDK + Emulator (x86_64 system image)
+      - name: Install Android SDK + Emulator (ARM64 system image)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           set -e
-          SDK_ROOT=~/android-sdk
+          SDK_ROOT=~/Library/Android/sdk
           mkdir -p "$SDK_ROOT/cmdline-tools"
           cd "$SDK_ROOT/cmdline-tools"
-          curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
           unzip -q cmdline-tools.zip
           mv cmdline-tools latest
+          cd "$SDK_ROOT"
           export ANDROID_HOME="$SDK_ROOT"
-          export ANDROID_SDK_ROOT="$SDK_ROOT"
           export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install \
             "platform-tools" \
             "emulator" \
             "platforms;android-${ANDROID_API_LEVEL}" \
-            "system-images;android-${ANDROID_API_LEVEL};google_apis;x86_64" \
+            "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
             "build-tools;${ANDROID_BUILD_TOOLS}"
-          echo "SDK install completed"
-
-      - name: Create AVD (x86_64)
-        run: |
-          set -e
-          export ANDROID_HOME="$HOME/android-sdk"
-          export ANDROID_SDK_ROOT="$HOME/android-sdk"
-          export ANDROID_AVD_HOME="$HOME/.android/avd"
-          mkdir -p "$ANDROID_AVD_HOME"
-          export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator"
-          echo "=== Available system images ==="
-          sdkmanager --list_installed | grep -E "system-images|platforms|build-tools" || true
-          echo "=== Creating AVD (x86_64) ==="
           echo "no" | avdmanager create avd \
             -n ${{ env.EMULATOR_NAME }} \
-            -k "system-images;android-${ANDROID_API_LEVEL};google_apis;x86_64" \
+            -k "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
             -d pixel_5 --force
-          echo "=== AVD created. Listing AVDs: ==="
-          avdmanager list avd | head -30
-          echo "=== AVD .ini file location ==="
-          ls -la "$ANDROID_AVD_HOME/"
 
-      - name: Add SDK to PATH
+      - name: Add Android SDK to PATH
         run: |
-          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
-          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/Library/Android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/platform-tools" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/emulator" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
+          echo "ANDROID_HOME=$HOME/Library/Android/sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/Library/Android/sdk" >> $GITHUB_ENV
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           # Pin frida to match Phantom Frida server version (17.13.0).
-          # Client/server should be within 1 minor version, but pinning exactly
-          # eliminates any protocol negotiation risk.
           pip install frida==17.13.0 "frida-tools<14.10" cryptography lief capstone pyyaml requests
 
-      - name: Fix KVM permissions
-        run: |
-          echo "=== Before fix ==="
-          ls -la /dev/kvm
-          id
-          # Try multiple approaches to grant KVM access
-          sudo chmod 666 /dev/kvm
-          echo "=== After chmod 666 ==="
-          ls -la /dev/kvm
-          # Also try adding to kvm group (may not take effect until next login,
-          # but we'll use sg/newgrp to work around that)
-          sudo gpasswd -a $USER kvm || true
-          # Verify we can actually open /dev/kvm
-          if [ -w /dev/kvm ]; then
-            echo "✓ /dev/kvm is writable by current user"
-          else
-            echo "✗ /dev/kvm is NOT writable — trying setfacl"
-            sudo apt-get install -y acl
-            sudo setfacl -m u:$USER:rw /dev/kvm
-            ls -la /dev/kvm
-            getfacl /dev/kvm
-          fi
-
-      - name: Boot emulator headless (KVM accelerated x86_64)
+      # ---------------------------------------------------------------------------
+      # Boot emulator headless using Apple's Hypervisor.framework (native ARM64)
+      # ---------------------------------------------------------------------------
+      - name: Boot emulator headless (native ARM64 via Hypervisor.framework)
         id: boot_emu
         continue-on-error: true
         run: |
           set -e
-          echo "=== CPU info ==="
-          nproc
-          grep -E "^(model name|flags)" /proc/cpuinfo | head -2
-          echo "=== KVM availability ==="
-          ls -la /dev/kvm
-          if [ -w /dev/kvm ]; then
-            echo "✓ /dev/kvm is writable"
-          else
-            echo "✗ /dev/kvm is NOT writable — KVM will fail"
-          fi
-          echo ""
-          echo "=== Starting x86_64 emulator with KVM acceleration ==="
-          # Use -accel auto (tries KVM, falls back to TCG)
-          # If KVM permissions still fail, the emulator will exit and we'll
-          # see the error in emulator.log
+          echo "=== Architecture check ==="
+          uname -m  # should be arm64
+          echo "=== AVD config ==="
+          cat ~/.android/avd/${{ env.EMULATOR_NAME }}.ini 2>/dev/null || true
+          cat ~/.android/avd/${{ env.EMULATOR_NAME }}.avd/config.ini 2>/dev/null | head -30 || true
+          echo "=== Starting ARM64 emulator ==="
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
-            -accel auto -no-metrics \
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -no-snapshot-save \
             -partition-size 2048 \
@@ -190,15 +152,6 @@ jobs:
           if ! kill -0 $EMU_PID 2>/dev/null; then
             echo "ERROR: emulator process died immediately"
             tail -100 ~/emulator.log
-            exit 1
-          fi
-          # Fail fast on KVM — don't let -accel auto silently fall back to
-          # TCG (software emulation), which is too slow to boot Android in
-          # the 10-minute boot timeout below.
-          if [ ! -w /dev/kvm ]; then
-            echo "ERROR: /dev/kvm is not writable — KVM acceleration unavailable."
-            echo "Cannot boot x86_64 Android emulator without KVM in under 10 min."
-            ls -la /dev/kvm 2>/dev/null || true
             exit 1
           fi
           echo "Waiting for device (up to 5 min)..."
@@ -233,90 +186,50 @@ jobs:
           echo ""
           echo "=== adb devices: ==="
           adb devices || true
-          echo ""
-          echo "=== Running processes (emulator/adb/qemu): ==="
-          ps aux | grep -E "emulator|adb|qemu" | grep -v grep || true
           exit 1
 
-      - name: Download Phantom Frida server (x86_64) — anti-detection build
+      # ---------------------------------------------------------------------------
+      # Download ARM64 APK splits + Phantom Frida ARM64 from the release
+      # ---------------------------------------------------------------------------
+      - name: Download ARM64 APK splits + Phantom Frida ARM64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Phantom Frida is the user's custom-built anti-detection Frida fork.
-          # It covers 16 detection vectors with ~90 patches (process name,
-          # libfrida-agent.so, thread names, memfd name, frida_agent_main symbol,
-          # SELinux labels, libc hooks, D-Bus service, default port, internal C
-          # symbols, GType names, temp paths, binary string residuals, build
-          # config defines, asset directory). The binary is built with
-          # --extended --temp-fixes for maximum stealth.
-          #
-          # This specific release uses:
-          #   custom_name = system_helper681 (replaces 'frida' everywhere)
-          #   port         = 37194 (built-in default, no flag needed)
-          #   arch         = android-x86_64
-          #   frida_version = 17.13.0 (matches frida-tools pip package)
-          #   extended     = true
-          #   temp_fixes   = true
-          #
-          # SHA256 of the .gz is verified against the official build-info.json
-          # published in the same release.
           set -e
-          PHANTOM_TAG="v17.13.0-android-x86_64-20260617"
-          PHANTOM_GZ="system_helper681-server-17.13.0-android-x86_64.gz"
-          PHANTOM_BIN="system_helper681-server-17.13.0-android-x86_64"
-          EXPECTED_SHA256="84043d8b46043a69567312fd8d50a253bac78c9c42503ea70feac6137a333e4b"
-          echo "=== Fetching Phantom Frida build-info.json (verify SHA256) ==="
-          curl -fsSL -o /tmp/build-info.json \
-            "https://github.com/michelledupuis/phantom-frida/releases/download/${PHANTOM_TAG}/build-info.json"
-          cat /tmp/build-info.json
-          ACTUAL_SHA256=$(jq -r '.artifacts.server_gz.sha256' /tmp/build-info.json)
-          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-            echo "ERROR: SHA256 mismatch in build-info.json"
-            echo "  expected: $EXPECTED_SHA256"
-            echo "  actual:   $ACTUAL_SHA256"
-            exit 1
-          fi
-          echo "✓ build-info.json SHA256 verified: $ACTUAL_SHA256"
-          PORT_FROM_JSON=$(jq -r '.port' /tmp/build-info.json)
-          CUSTOM_NAME_FROM_JSON=$(jq -r '.custom_name' /tmp/build-info.json)
-          echo "Phantom Frida custom_name: $CUSTOM_NAME_FROM_JSON, port: $PORT_FROM_JSON"
-          if [ "$PORT_FROM_JSON" != "37194" ] || [ "$CUSTOM_NAME_FROM_JSON" != "system_helper681" ]; then
-            echo "ERROR: unexpected Phantom Frida build parameters"
-            exit 1
-          fi
-          echo "=== Downloading $PHANTOM_GZ (~44MB) ==="
-          mkdir -p ~/phantom-frida
-          cd ~/phantom-frida
-          curl -fsSL -o "$PHANTOM_GZ" \
-            "https://github.com/michelledupuis/phantom-frida/releases/download/${PHANTOM_TAG}/${PHANTOM_GZ}"
-          DOWNLOAD_SHA256=$(sha256sum "$PHANTOM_GZ" | awk '{print $1}')
-          if [ "$DOWNLOAD_SHA256" != "$EXPECTED_SHA256" ]; then
-            echo "ERROR: downloaded .gz SHA256 mismatch"
-            echo "  expected: $EXPECTED_SHA256"
-            echo "  actual:   $DOWNLOAD_SHA256"
-            exit 1
-          fi
-          echo "✓ downloaded .gz SHA256 verified: $DOWNLOAD_SHA256"
-          gunzip -k "$PHANTOM_GZ"
-          chmod +x "$PHANTOM_BIN"
-          ls -lh "$PHANTOM_BIN"
-          file "$PHANTOM_BIN" || true
-          # Persist parameters for subsequent steps
-          echo "37194" > ~/phantom-frida-port.txt
-          echo "system_helper681" > ~/phantom-frida-name.txt
+          mkdir -p ~/arm64_assets
+          cd ~/arm64_assets
+          TAG="${{ env.ARM64_ASSETS_TAG }}"
+          REPO="${{ github.repository }}"
+          echo "=== Downloading assets from release $TAG in repo $REPO ==="
+          for asset in base.apk split_config.arm64_v8a.apk split_config.xxhdpi.apk system_helper681-server-17.13.0-android-arm64.gz; do
+            echo "--- Downloading $asset ---"
+            curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/octet-stream" \
+              "https://github.com/$REPO/releases/download/$TAG/$asset" -o "$asset"
+            ls -lh "$asset"
+          done
+          echo "=== Verifying all assets ==="
+          ls -lh ~/arm64_assets/
+          echo "=== Decompressing Phantom Frida ARM64 ==="
+          cd ~/arm64_assets
+          gunzip -kf system_helper681-server-17.13.0-android-arm64.gz
+          chmod +x system_helper681-server-17.13.0-android-arm64
+          file system_helper681-server-17.13.0-android-arm64
+          ls -lh system_helper681-server-17.13.0-android-arm64
 
-      - name: Start Phantom Frida server on emulator (port 37194)
+      # ---------------------------------------------------------------------------
+      # Start Phantom Frida ARM64 on emulator (port 37194)
+      # ---------------------------------------------------------------------------
+      - name: Start Phantom Frida ARM64 server on emulator
         run: |
-          PHANTOM_BIN="system_helper681-server-17.13.0-android-x86_64"
-          PORT=$(cat ~/phantom-frida-port.txt)
-          NAME=$(cat ~/phantom-frida-name.txt)
+          PHANTOM_BIN="system_helper681-server-17.13.0-android-arm64"
+          PORT=37194
+          NAME="system_helper681"
           echo "Phantom Frida name: $NAME, port: $PORT"
-          # NOTE: do NOT use `set -e` here — adb root can fail transiently right
-          # after boot completes (adbd is not yet ready to switch to root mode).
-          # We use an explicit retry loop instead.
           echo "=== Waiting 20s for adbd to stabilize after boot ==="
           sleep 20
           adb wait-for-device
-          # Retry adb root up to 8 times — it can return "unable to connect for
-          # root: closed" for ~30s after sys.boot_completed is set.
+          # Retry adb root
           ROOT_OK=0
           for i in 1 2 3 4 5 6 7 8; do
             echo "=== adb root attempt $i ==="
@@ -331,13 +244,11 @@ jobs:
           done
           if [ $ROOT_OK -eq 0 ]; then
             echo "ERROR: adb root failed after 8 attempts"
-            echo "=== Diagnostic ==="
             adb shell getprop ro.debuggable 2>&1 || true
             adb shell id 2>&1 || true
             adb shell getprop ro.build.type 2>&1 || true
             exit 1
           fi
-          # Wait for adbd to restart with root privileges (reboot of adbd)
           sleep 8
           adb wait-for-device
           echo "=== Verify root: adb shell id ==="
@@ -347,29 +258,18 @@ jobs:
             exit 1
           fi
           echo "✓ adb shell is running as root"
-          # Push to /data/local/tmp/ — use a NON-'frida' filename (binary already
-          # uses system_helper681 as the internal name; we keep the filename
-          # consistent so detection vector #1 (process name) is fully obscured)
-          adb push ~/phantom-frida/$PHANTOM_BIN /data/local/tmp/${NAME}-server
+          adb push ~/arm64_assets/$PHANTOM_BIN /data/local/tmp/${NAME}-server
           adb shell "chmod 755 /data/local/tmp/${NAME}-server"
-          # Launch in daemon mode. Phantom Frida binary has port 37194 baked in
-          # as default (built via --port 37194), so no -l flag needed.
           adb shell "nohup /data/local/tmp/${NAME}-server -D > /data/local/tmp/${NAME}-server.log 2>&1 &"
-          # Give the server time to bind to port 37194
           sleep 8
-          # Verify the server is actually running
           echo "=== Processes matching ${NAME} on device ==="
-          adb shell "ps -A | grep -E '${NAME}|37194' || echo '(no match — checking all processes)'"
-          echo "=== /data/local/tmp/${NAME}-server.log (first 30 lines) ==="
-          adb shell "cat /data/local/tmp/${NAME}-server.log 2>&1 | head -30"
+          adb shell "ps -A | grep -E '${NAME}|37194' || echo '(no match)'"
           echo "=== /data/local/tmp/${NAME}-server.log (last 30 lines) ==="
           adb shell "cat /data/local/tmp/${NAME}-server.log 2>&1 | tail -30"
-          echo "=== Setting up ADB port forward (PC tcp:37194 -> device tcp:37194) ==="
+          echo "=== Setting up ADB port forward ==="
           adb forward tcp:${PORT} tcp:${PORT}
           adb forward --list
-          # Quick smoke test: frida-ps -H should list device processes
-          # (retry up to 5 times — server may need a few seconds to fully start)
-          echo "=== frida-ps -H 127.0.0.1:${PORT} smoke test (with retries) ==="
+          echo "=== frida-ps -H 127.0.0.1:${PORT} smoke test ==="
           for i in 1 2 3 4 5; do
             PS_OUT=$(timeout 30 frida-ps -H 127.0.0.1:${PORT} 2>&1)
             if echo "$PS_OUT" | grep -qE "^[0-9]+"; then
@@ -381,15 +281,30 @@ jobs:
             echo "$PS_OUT" | head -5
             sleep 5
           done
+          # Persist
+          echo "$PORT" > ~/phantom-frida-port.txt
+          echo "$NAME" > ~/phantom-frida-name.txt
 
+      # ---------------------------------------------------------------------------
+      # Install ARM64 APK on emulator
+      # ---------------------------------------------------------------------------
+      - name: Install Ecobank ARM64 APK
+        run: |
+          set -e
+          echo "=== Installing ARM64 APK via adb install-multiple ==="
+          cd ~/arm64_assets
+          adb install-multiple -r base.apk split_config.arm64_v8a.apk split_config.xxhdpi.apk
+          echo "=== Verifying install ==="
+          adb shell pm list packages | grep ecobank
+          adb shell dumpsys package com.app.ecobank | grep -E "versionName|versionCode|primaryCpuAbi" | head -5
+
+      # ---------------------------------------------------------------------------
+      # MCP HTTP Server + Cloudflared tunnel (same as ubuntu workflow)
+      # ---------------------------------------------------------------------------
       - name: Install MCP server deps + generate token
         run: |
           cd $GITHUB_WORKSPACE
-          # NOTE: do NOT use --ignore-scripts — node-pty's prebuild-install
-          # postinstall is what fetches the linux-x64 prebuilt binary.
-          # Without it, dist/src/server.js will throw "Cannot find module node-pty".
           npm install --no-audit --no-fund --loglevel=error
-          # Verify node-pty prebuilt loaded successfully
           node -e "const pty=require('node-pty'); console.log('node-pty OK, version:', require('node-pty/package.json').version);"
           TOKEN=$(node 4f72e6a6.js .mcp-auth-token)
           if [ -z "$TOKEN" ]; then
@@ -398,11 +313,6 @@ jobs:
           fi
           echo "Token generated: ${#TOKEN} chars"
           echo "$TOKEN" > ~/mcp-token.txt
-          # NOTE: we intentionally do NOT call ::add-mask::$TOKEN here.
-          # poll_workflow.py (on the agent side) extracts the token from this
-          # job's log via the regex r'Auth Token:\s*([a-f0-9]{64})'. Masking
-          # it would replace the token with '**' in the log and break polling.
-          # The repo is private; the token is single-session and expires with the VM.
 
       - name: Start MCP server + cloudflared tunnel
         run: |
@@ -419,7 +329,11 @@ jobs:
             exit 1
           fi
           echo "MCP server is up at http://127.0.0.1:8808/mcp"
-          nohup cloudflared tunnel --url http://localhost:8808 > ~/cloudflared.log 2>&1 &
+          if [ -n "${{ inputs.tunnel_token }}" ]; then
+            nohup cloudflared tunnel run --token "${{ inputs.tunnel_token }}" > ~/cloudflared.log 2>&1 &
+          else
+            nohup cloudflared tunnel --url http://localhost:8808 > ~/cloudflared.log 2>&1 &
+          fi
           CF_PID=$!
           echo "Cloudflared PID: $CF_PID"
           for i in $(seq 1 30); do
@@ -436,7 +350,7 @@ jobs:
           fi
           echo "$TUNNEL_URL" > ~/tunnel-url.txt
           {
-            echo "## ARM64 VM Connection Info"
+            echo "## ARM64 Native VM Connection Info"
             echo ""
             echo "**MCP URL:** \`$TUNNEL_URL/mcp\`"
             echo ""
@@ -455,7 +369,7 @@ jobs:
       - name: Print connection info (prominent)
         run: |
           echo "=========================================================="
-          echo "          ARM64 VM READY FOR USE"
+          echo "       ARM64 NATIVE VM READY FOR USE"
           echo "=========================================================="
           echo ""
           echo "MCP URL:        $(cat ~/tunnel-url.txt)/mcp"
@@ -464,21 +378,19 @@ jobs:
           echo "Android API:    $(adb shell getprop ro.build.version.sdk | tr -d "\r")"
           echo "Fingerprint:    $(adb shell getprop ro.build.fingerprint | tr -d "\r")"
           echo ""
-          echo "Phantom Frida processes on device:"
           NAME=$(cat ~/phantom-frida-name.txt)
           PORT=$(cat ~/phantom-frida-port.txt)
-          adb shell "ps -A | grep -E '${NAME}' || echo '(no ${NAME} processes — server died?)'"
+          echo "Phantom Frida ARM64 on :${PORT}"
+          adb shell "ps -A | grep -E '${NAME}' || echo '(no ${NAME} processes)'"
           echo ""
           echo "First 10 frida-ps -H 127.0.0.1:${PORT} entries:"
-          timeout 15 frida-ps -H 127.0.0.1:${PORT} 2>&1 | head -10 || echo "(frida-ps -H timed out or failed)"
+          timeout 15 frida-ps -H 127.0.0.1:${PORT} 2>&1 | head -10 || echo "(frida-ps -H timed out)"
+          echo ""
+          echo "Ecobank package:"
+          adb shell pm list packages | grep ecobank || echo "(not installed)"
           echo ""
           echo "VM will stay alive for ${{ inputs.session_minutes }} minutes."
 
-      # ---------------------------------------------------------------------------
-      # Mid-run artifact upload so the agent can fetch connection info via API
-      # BEFORE the keep-alive loop finishes. (GitHub does not expose in-progress
-      # job logs via API; the log blob is only uploaded on job completion.)
-      # ---------------------------------------------------------------------------
       - name: Publish connection info as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -501,10 +413,8 @@ jobs:
               echo "[$(date)] ADB lost! Reconnecting..."
               adb kill-server; sleep 2; adb start-server
               adb wait-for-device || break
-              # Re-establish port forward after ADB restart
               adb forward tcp:${PORT} tcp:${PORT} || true
             fi
-            # Check Phantom Frida server (renamed) is alive
             if ! adb shell "pgrep -f /data/local/tmp/${NAME}-server" > /dev/null 2>&1; then
               echo "[$(date)] ${NAME}-server died, restarting..."
               adb shell "nohup /data/local/tmp/${NAME}-server -D > /data/local/tmp/${NAME}-server.log 2>&1 &"
@@ -523,7 +433,7 @@ jobs:
               nohup cloudflared tunnel --url http://localhost:8808 >> ~/cloudflared.log 2>&1 &
             fi
             if [ $((HEARTBEAT % 10)) -eq 0 ]; then
-              echo "[$(date)] Heartbeat #$HEARTBEAT — VM still alive (Phantom Frida on :${PORT})"
+              echo "[$(date)] Heartbeat #$HEARTBEAT — VM still alive (Phantom Frida ARM64 on :${PORT})"
             fi
             sleep 60
           done
