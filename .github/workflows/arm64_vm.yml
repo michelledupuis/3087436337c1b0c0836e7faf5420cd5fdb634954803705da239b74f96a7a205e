@@ -53,6 +53,14 @@ jobs:
             libxshmfence1 \
             cpu-checker \
             android-tools-adb
+          # Grant KVM access to the runner user (GitHub Actions runners have /dev/kvm
+          # but the runner user is NOT in the kvm group by default).
+          sudo gpasswd -a $USER kvm || true
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          # Verify KVM access
+          kvm-ok 2>/dev/null || echo "kvm-ok not available"
+          ls -la /dev/kvm 2>/dev/null || echo "(no /dev/kvm)"
+          # Install cloudflared
           curl -L -o /tmp/cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cloudflared.deb
