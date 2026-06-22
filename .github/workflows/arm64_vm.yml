@@ -1,0 +1,268 @@
+name: ARM64 Android VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: 'Session duration in minutes (max 330)'
+        required: true
+        default: '240'
+      phantom_frida_url:
+        description: 'URL to Phantom Frida ARM64 binary (optional)'
+        required: false
+        default: 'https://github.com/michelledupuis/phantom-frida/releases/download/v17.13.0-android-arm64-20260621/phantom-frida-arm64'
+
+jobs:
+  arm64_vm:
+    runs-on: macos-14
+    timeout-minutes: 350
+    env:
+      ANDROID_API_LEVEL: 30
+      ANDROID_BUILD_TOOLS: 30.0.3
+      EMULATOR_NAME: e
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Android SDK + AVD
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Android/sdk
+            ~/.android/avd
+          key: android-sdk-arm64-api30-v5
+
+      - name: Install Android SDK + Emulator
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          SDK_ROOT=~/Library/Android/sdk
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          cd "$SDK_ROOT/cmdline-tools"
+          curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
+          unzip -q cmdline-tools.zip
+          mv cmdline-tools latest
+          export ANDROID_HOME="$SDK_ROOT"
+          export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator"
+          yes | sdkmanager --licenses > /dev/null 2>&1
+          sdkmanager --install \
+            "platform-tools" \
+            "emulator" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          echo "no" | avdmanager create avd \
+            -n ${{ env.EMULATOR_NAME }} \
+            -k "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
+            -d pixel_5 --force
+
+      - name: Add SDK to PATH
+        run: |
+          echo "$HOME/Library/Android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/platform-tools" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/emulator" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
+          echo "ANDROID_HOME=$HOME/Library/Android/sdk" >> $GITHUB_ENV
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install frida frida-tools cryptography lief capstone pyyaml requests
+
+      - name: Install cloudflared
+        run: brew install cloudflared
+
+      - name: Boot emulator headless
+        run: |
+          set -e
+          nohup emulator -avd ${{ env.EMULATOR_NAME }} \
+            -no-window -no-audio -no-boot-anim -no-snapshot \
+            -gpu swiftshader_indirect -no-snapshot-save \
+            -partition-size 2048 \
+            > ~/emulator.log 2>&1 &
+          echo "Emulator PID: $!"
+          adb wait-for-device
+          echo "Waiting for boot completion (up to 5 min)..."
+          timeout 300 bash -c '
+            while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do
+              sleep 5
+            done
+          '
+          echo "=== Boot completed ==="
+          echo "ABI:        $(adb shell getprop ro.product.cpu.abi | tr -d "\r")"
+          echo "API level:  $(adb shell getprop ro.build.version.sdk | tr -d "\r")"
+          echo "Fingerprint: $(adb shell getprop ro.build.fingerprint | tr -d "\r")"
+
+      - name: Download Frida server (ARM64)
+        run: |
+          FRIDA_VER=$(python -c "import frida; print(frida.__version__)")
+          echo "Frida version: $FRIDA_VER"
+          curl -L -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-server-${FRIDA_VER}-android-arm64.xz"
+          xz -d frida-server.xz
+          mkdir -p ~/frida
+          mv frida-server ~/frida/frida-server-arm64
+          chmod +x ~/frida/frida-server-arm64
+
+      - name: Download Phantom Frida (ARM64)
+        run: |
+          curl -L -o ~/frida/phantom-frida-arm64 "${{ inputs.phantom_frida_url }}"
+          chmod +x ~/frida/phantom-frida-arm64
+          ls -la ~/frida/
+
+      - name: Start frida-server on emulator
+        run: |
+          adb root
+          sleep 3
+          adb wait-for-device
+          adb push ~/frida/frida-server-arm64 /data/local/tmp/frida-server
+          adb push ~/frida/phantom-frida-arm64 /data/local/tmp/phantom-frida
+          adb shell "chmod 755 /data/local/tmp/frida-server /data/local/tmp/phantom-frida"
+          adb shell "nohup /data/local/tmp/frida-server -D > /data/local/tmp/frida-server.log 2>&1 &"
+          sleep 3
+          adb shell "ps -A | grep frida"
+
+      - name: Install MCP server deps + generate token
+        run: |
+          cd $GITHUB_WORKSPACE
+          npm install --ignore-scripts
+          TOKEN=$(node 4f72e6a6.js .mcp-auth-token)
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: token generation failed"
+            exit 1
+          fi
+          echo "Token generated: ${#TOKEN} chars"
+          echo "$TOKEN" > ~/mcp-token.txt
+          echo "::add-mask::$TOKEN"
+
+      - name: Start MCP server + cloudflared tunnel
+        run: |
+          cd $GITHUB_WORKSPACE
+          TOKEN=$(cat ~/mcp-token.txt)
+          export MCP_HTTP_AUTH_TOKEN="$TOKEN"
+          nohup node dist/src/server.js --transport http --host 127.0.0.1 --port 8808 > ~/mcp-server.log 2>&1 &
+          MCP_PID=$!
+          echo "MCP server PID: $MCP_PID"
+          sleep 5
+          if ! curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8808/mcp | grep -qE "200|401|405"; then
+            echo "ERROR: MCP server not responding"
+            cat ~/mcp-server.log
+            exit 1
+          fi
+          echo "MCP server is up at http://127.0.0.1:8808/mcp"
+          nohup cloudflared tunnel --url http://localhost:8808 > ~/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo "Cloudflared PID: $CF_PID"
+          for i in $(seq 1 30); do
+            TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' ~/cloudflared.log 2>/dev/null | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "ERROR: tunnel URL not found in cloudflared log"
+            cat ~/cloudflared.log
+            exit 1
+          fi
+          echo "$TUNNEL_URL" > ~/tunnel-url.txt
+          {
+            echo "## ARM64 VM Connection Info"
+            echo ""
+            echo "**MCP URL:** \`$TUNNEL_URL/mcp\`"
+            echo ""
+            echo "**Auth Token:** \`$TOKEN\`"
+            echo ""
+            echo "**Emulator ABI:** \`$(adb shell getprop ro.product.cpu.abi | tr -d "\r")\`"
+            echo "**Android API:** \`$(adb shell getprop ro.build.version.sdk | tr -d "\r")\`"
+            echo "**Fingerprint:** \`$(adb shell getprop ro.build.fingerprint | tr -d "\r")\`"
+            echo ""
+            echo "To connect via mcp_shell.py:"
+            echo '```bash'
+            echo "python mcp_shell.py --url $TUNNEL_URL/mcp --token $TOKEN \"adb shell getprop ro.product.cpu.abi\""
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Print connection info (prominent)
+        run: |
+          echo "=========================================================="
+          echo "          ARM64 VM READY FOR USE"
+          echo "=========================================================="
+          echo ""
+          echo "MCP URL:        $(cat ~/tunnel-url.txt)/mcp"
+          echo "Auth Token:     $(cat ~/mcp-token.txt)"
+          echo "Emulator ABI:   $(adb shell getprop ro.product.cpu.abi | tr -d "\r")"
+          echo "Android API:    $(adb shell getprop ro.build.version.sdk | tr -d "\r")"
+          echo "Fingerprint:    $(adb shell getprop ro.build.fingerprint | tr -d "\r")"
+          echo ""
+          echo "Frida processes on device:"
+          adb shell "ps -A | grep frida"
+          echo ""
+          echo "First 10 frida-ps -U entries:"
+          frida-ps -U | head -10
+          echo ""
+          echo "VM will stay alive for ${{ inputs.session_minutes }} minutes."
+
+      - name: Keep VM alive (session loop)
+        run: |
+          END=$((SECONDS + ${{ inputs.session_minutes }} * 60))
+          HEARTBEAT=0
+          while [ $SECONDS -lt $END ]; do
+            HEARTBEAT=$((HEARTBEAT + 1))
+            if ! adb shell echo alive > /dev/null 2>&1; then
+              echo "[$(date)] ADB lost! Reconnecting..."
+              adb kill-server; sleep 2; adb start-server
+              adb wait-for-device || break
+            fi
+            if ! adb shell "pgrep -f /data/local/tmp/frida-server" > /dev/null 2>&1; then
+              echo "[$(date)] frida-server died, restarting..."
+              adb shell "nohup /data/local/tmp/frida-server -D > /data/local/tmp/frida-server.log 2>&1 &"
+            fi
+            if ! pgrep -f "dist/src/server.js" > /dev/null 2>&1; then
+              echo "[$(date)] MCP server died, restarting..."
+              cd $GITHUB_WORKSPACE
+              TOKEN=$(cat ~/mcp-token.txt)
+              export MCP_HTTP_AUTH_TOKEN="$TOKEN"
+              nohup node dist/src/server.js --transport http --host 127.0.0.1 --port 8808 >> ~/mcp-server.log 2>&1 &
+            fi
+            if ! pgrep -f "cloudflared tunnel" > /dev/null 2>&1; then
+              echo "[$(date)] cloudflared died, restarting..."
+              nohup cloudflared tunnel --url http://localhost:8808 >> ~/cloudflared.log 2>&1 &
+            fi
+            if [ $((HEARTBEAT % 10)) -eq 0 ]; then
+              echo "[$(date)] Heartbeat #$HEARTBEAT — VM still alive"
+            fi
+            sleep 60
+          done
+          echo "[$(date)] Session ended after ${{ inputs.session_minutes }} minutes."
+
+      - name: Upload logs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-vm-logs-${{ github.run_id }}
+          path: |
+            ~/emulator.log
+            ~/mcp-server.log
+            ~/cloudflared.log
+            ~/tunnel-url.txt
+            ~/mcp-token.txt
+          if-no-files-found: ignore
+          retention-days: 7
