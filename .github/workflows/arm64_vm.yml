@@ -1,8 +1,8 @@
-name: ARM64 Android VM (macOS-14 ARM64 + TCG)
+name: ARM64 Android VM (macOS-14 native)
 
 # =============================================================================
-# This workflow spins up an ARM64 Android emulator on a GitHub Actions
-# macOS-14 (Apple Silicon M1) runner using TCG software emulation.
+# This workflow spins up a NATIVE ARM64 Android emulator on a GitHub Actions
+# macOS-14 (Apple Silicon M1) runner.
 #
 # WHY ARM64 NATIVE (not ubuntu x86_64):
 #   - All our prior RE artifacts are ARM64:
@@ -16,22 +16,11 @@ name: ARM64 Android VM (macOS-14 ARM64 + TCG)
 #     This is the FUNDAMENTAL blocker on x86_64 that no amount of Frida hooking
 #     can fix (overwriting r_brk in linker causes #UD because 0xD6 is invalid
 #     in x86_64 long mode).
-#   - On ARM64, there is NO CPUID instruction -> no "KVMKVMKVM" CPUID
-#     signature -> DexProtector's check 0x0d (CPUID hypervisor detection) PASSES.
-#
-# WHY TCG (not HVF):
-#   - GHA macOS-14 runners don't expose Hypervisor.framework (HVF) to nested
-#     virtualization (HVF error: HV_UNSUPPORTED).
-#   - ubuntu-22.04-arm runners expose /dev/kvm but sdkmanager doesn't ship the
-#     `emulator` package for linux-arm64 (Warning: Failed to find package 'emulator').
-#   - TCG (Tiny Code Generator) is QEMU's software emulation. On macOS-14 ARM64
-#     host running an ARM64 guest, TCG is same-arch emulation — reasonably fast
-#     (Android boots in ~15-20 min vs ~3-5 min with HVF). We increase the boot
-#     timeout to 25 min to accommodate.
-#
-# Net result: VM produces correct ARM64 outer key -> DPLF decrypts -> inner
-# libdp.so loads -> HMAC wrapper is hookable -> password captured ->
-# master_key computed -> classes.ecobank.dat decrypted.
+#   - On macOS-14 ARM64, there is NO KVM hypervisor -> no CPUID "KVMKVMKVM"
+#     signature -> DexProtector's check 0x0d (hypervisor detection) PASSES.
+#   - Net result: VM produces correct ARM64 outer key -> DPLF decrypts -> inner
+#     libdp.so loads -> HMAC wrapper is hookable -> password captured ->
+#     master_key computed -> classes.ecobank.dat decrypted.
 # =============================================================================
 
 on:
@@ -94,7 +83,7 @@ jobs:
           path: |
             ~/Library/Android/sdk
             ~/.android/avd
-          key: android-sdk-arm64-macos-tcg-api30-v1
+          key: android-sdk-arm64-api30-googleapis-v5
 
       - name: Install Android SDK + Emulator (ARM64 system image)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
@@ -140,7 +129,7 @@ jobs:
       # ---------------------------------------------------------------------------
       # Boot emulator headless using Apple's Hypervisor.framework (native ARM64)
       # ---------------------------------------------------------------------------
-      - name: Boot emulator headless (ARM64 TCG software emulation)
+      - name: Boot emulator headless (native ARM64 via Hypervisor.framework)
         id: boot_emu
         continue-on-error: true
         run: |
@@ -150,13 +139,8 @@ jobs:
           echo "=== AVD config ==="
           cat ~/.android/avd/${{ env.EMULATOR_NAME }}.ini 2>/dev/null || true
           cat ~/.android/avd/${{ env.EMULATOR_NAME }}.avd/config.ini 2>/dev/null | head -30 || true
-          echo "=== Starting ARM64 emulator with -accel off (forces TCG software emulation) ==="
-          echo "(HVF is unavailable on GHA macOS runners; -accel off disables HW accel, falls back to QEMU TCG)"
-          # NOTE: -accel tcg is INVALID on macOS emulator (valid: on/off/auto).
-          # -accel auto tries HVF first, and emulator 36.x exits on HVF failure
-          # instead of falling back to TCG (known bug). -accel off forces TCG.
+          echo "=== Starting ARM64 emulator ==="
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
-            -accel off -no-metrics \
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -no-snapshot-save \
             -partition-size 2048 \
@@ -170,20 +154,20 @@ jobs:
             tail -100 ~/emulator.log
             exit 1
           fi
-          echo "Waiting for device (up to 10 min)..."
-          if ! timeout 600 adb wait-for-device; then
-            echo "ERROR: adb wait-for-device timed out after 10 min"
+          echo "Waiting for device (up to 5 min)..."
+          if ! timeout 300 adb wait-for-device; then
+            echo "ERROR: adb wait-for-device timed out after 5 min"
             tail -100 ~/emulator.log
             exit 1
           fi
-          echo "Device registered. Waiting for boot completion (up to 25 min)..."
-          if ! timeout 1500 bash -c '
+          echo "Device registered. Waiting for boot completion (up to 10 min)..."
+          if ! timeout 600 bash -c '
             while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do
-              sleep 10
+              sleep 5
               echo -n "."
             done
           '; then
-            echo "ERROR: boot completion timed out after 25 min"
+            echo "ERROR: boot completion timed out after 10 min"
             tail -100 ~/emulator.log
             adb shell getprop | head -50
             exit 1
