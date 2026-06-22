@@ -150,12 +150,13 @@ jobs:
           echo "=== AVD config ==="
           cat ~/.android/avd/${{ env.EMULATOR_NAME }}.ini 2>/dev/null || true
           cat ~/.android/avd/${{ env.EMULATOR_NAME }}.avd/config.ini 2>/dev/null | head -30 || true
-          echo "=== Starting ARM64 emulator with TCG (software emulation) ==="
-          echo "(HVF is unavailable on GHA macOS runners; TCG is same-arch ARM64->ARM64, ~15-20 min boot)"
-          # Force TCG acceleration. -no-accel is too aggressive (disables all);
-          # -accel tcg forces QEMU TCG backend.
+          echo "=== Starting ARM64 emulator with -accel off (forces TCG software emulation) ==="
+          echo "(HVF is unavailable on GHA macOS runners; -accel off disables HW accel, falls back to QEMU TCG)"
+          # NOTE: -accel tcg is INVALID on macOS emulator (valid: on/off/auto).
+          # -accel auto tries HVF first, and emulator 36.x exits on HVF failure
+          # instead of falling back to TCG (known bug). -accel off forces TCG.
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
-            -accel tcg -no-metrics \
+            -accel off -no-metrics \
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -no-snapshot-save \
             -partition-size 2048 \
