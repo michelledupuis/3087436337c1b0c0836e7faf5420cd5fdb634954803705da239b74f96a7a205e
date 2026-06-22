@@ -346,6 +346,21 @@ jobs:
           echo ""
           echo "VM will stay alive for ${{ inputs.session_minutes }} minutes."
 
+      # ---------------------------------------------------------------------------
+      # Mid-run artifact upload so the agent can fetch connection info via API
+      # BEFORE the keep-alive loop finishes. (GitHub does not expose in-progress
+      # job logs via API; the log blob is only uploaded on job completion.)
+      # ---------------------------------------------------------------------------
+      - name: Publish connection info as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection-info
+          path: |
+            ~/tunnel-url.txt
+            ~/mcp-token.txt
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Keep VM alive (session loop)
         run: |
           END=$((SECONDS + ${{ inputs.session_minutes }} * 60))
