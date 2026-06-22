@@ -129,7 +129,10 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install frida frida-tools cryptography lief capstone pyyaml requests
+          # Pin frida to match Phantom Frida server version (17.13.0).
+          # Client/server should be within 1 minor version, but pinning exactly
+          # eliminates any protocol negotiation risk.
+          pip install frida==17.13.0 "frida-tools<14.10" cryptography lief capstone pyyaml requests
 
       - name: Fix KVM permissions
         run: |
@@ -302,14 +305,48 @@ jobs:
 
       - name: Start Phantom Frida server on emulator (port 37194)
         run: |
-          set -e
           PHANTOM_BIN="system_helper681-server-17.13.0-android-x86_64"
           PORT=$(cat ~/phantom-frida-port.txt)
           NAME=$(cat ~/phantom-frida-name.txt)
           echo "Phantom Frida name: $NAME, port: $PORT"
-          adb root
-          sleep 3
+          # NOTE: do NOT use `set -e` here — adb root can fail transiently right
+          # after boot completes (adbd is not yet ready to switch to root mode).
+          # We use an explicit retry loop instead.
+          echo "=== Waiting 20s for adbd to stabilize after boot ==="
+          sleep 20
           adb wait-for-device
+          # Retry adb root up to 8 times — it can return "unable to connect for
+          # root: closed" for ~30s after sys.boot_completed is set.
+          ROOT_OK=0
+          for i in 1 2 3 4 5 6 7 8; do
+            echo "=== adb root attempt $i ==="
+            ADB_ROOT_OUT=$(adb root 2>&1)
+            echo "$ADB_ROOT_OUT"
+            if echo "$ADB_ROOT_OUT" | grep -qE "restarting via|already running as root"; then
+              echo "✓ adb root succeeded on attempt $i"
+              ROOT_OK=1
+              break
+            fi
+            sleep 5
+          done
+          if [ $ROOT_OK -eq 0 ]; then
+            echo "ERROR: adb root failed after 8 attempts"
+            echo "=== Diagnostic ==="
+            adb shell getprop ro.debuggable 2>&1 || true
+            adb shell id 2>&1 || true
+            adb shell getprop ro.build.type 2>&1 || true
+            exit 1
+          fi
+          # Wait for adbd to restart with root privileges (reboot of adbd)
+          sleep 8
+          adb wait-for-device
+          echo "=== Verify root: adb shell id ==="
+          adb shell id
+          if ! adb shell id | grep -q "uid=0(root)"; then
+            echo "ERROR: adb shell is NOT root after adb root"
+            exit 1
+          fi
+          echo "✓ adb shell is running as root"
           # Push to /data/local/tmp/ — use a NON-'frida' filename (binary already
           # uses system_helper681 as the internal name; we keep the filename
           # consistent so detection vector #1 (process name) is fully obscured)
@@ -318,18 +355,32 @@ jobs:
           # Launch in daemon mode. Phantom Frida binary has port 37194 baked in
           # as default (built via --port 37194), so no -l flag needed.
           adb shell "nohup /data/local/tmp/${NAME}-server -D > /data/local/tmp/${NAME}-server.log 2>&1 &"
-          sleep 5
+          # Give the server time to bind to port 37194
+          sleep 8
           # Verify the server is actually running
           echo "=== Processes matching ${NAME} on device ==="
-          adb shell "ps -A | grep -E '${NAME}|37194' || echo '(no match — checking all processes)' && ps -A | head -30"
+          adb shell "ps -A | grep -E '${NAME}|37194' || echo '(no match — checking all processes)'"
+          echo "=== /data/local/tmp/${NAME}-server.log (first 30 lines) ==="
+          adb shell "cat /data/local/tmp/${NAME}-server.log 2>&1 | head -30"
+          echo "=== /data/local/tmp/${NAME}-server.log (last 30 lines) ==="
+          adb shell "cat /data/local/tmp/${NAME}-server.log 2>&1 | tail -30"
           echo "=== Setting up ADB port forward (PC tcp:37194 -> device tcp:37194) ==="
           adb forward tcp:${PORT} tcp:${PORT}
           adb forward --list
           # Quick smoke test: frida-ps -H should list device processes
-          echo "=== frida-ps -H 127.0.0.1:${PORT} smoke test ==="
-          timeout 30 frida-ps -H 127.0.0.1:${PORT} 2>&1 | head -15 || echo "(frida-ps -H smoke test failed — server may still be starting)"
-          echo "=== ${NAME}-server.log (device) ==="
-          adb shell "cat /data/local/tmp/${NAME}-server.log 2>&1 | tail -30"
+          # (retry up to 5 times — server may need a few seconds to fully start)
+          echo "=== frida-ps -H 127.0.0.1:${PORT} smoke test (with retries) ==="
+          for i in 1 2 3 4 5; do
+            PS_OUT=$(timeout 30 frida-ps -H 127.0.0.1:${PORT} 2>&1)
+            if echo "$PS_OUT" | grep -qE "^[0-9]+"; then
+              echo "✓ frida-ps succeeded on attempt $i"
+              echo "$PS_OUT" | head -15
+              break
+            fi
+            echo "(frida-ps attempt $i failed, retrying in 5s)"
+            echo "$PS_OUT" | head -5
+            sleep 5
+          done
 
       - name: Install MCP server deps + generate token
         run: |
