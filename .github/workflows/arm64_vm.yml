@@ -1,4 +1,4 @@
-name: ARM64 Android VM
+name: Android VM
 
 on:
   workflow_dispatch:
@@ -7,10 +7,6 @@ on:
         description: 'Session duration in minutes (max 330)'
         required: true
         default: '240'
-      phantom_frida_url:
-        description: 'URL to Phantom Frida ARM64 binary (optional)'
-        required: false
-        default: 'https://github.com/michelledupuis/phantom-frida/releases/download/v17.13.0-android-arm64-20260621/phantom-frida-arm64'
 
 jobs:
   arm64_vm:
@@ -41,11 +37,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Linux deps (QEMU, cloudflared, etc.)
+      - name: Install Linux deps (KVM, cloudflared, etc.)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            qemu-system-arm \
+            qemu-system-x86 \
             qemu-utils \
             qemu-user-static \
             bridge-utils \
@@ -55,8 +51,8 @@ jobs:
             libasound2 \
             libgl1 \
             libxshmfence1 \
-            cpu-checker
-          # Install cloudflared directly (no brew on Linux)
+            cpu-checker \
+            android-tools-adb
           curl -L -o /tmp/cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cloudflared.deb
@@ -68,9 +64,9 @@ jobs:
         with:
           path: |
             ~/android-sdk
-          key: android-sdk-arm64-linux-api30-v2
+          key: android-sdk-x86_64-linux-api30-v1
 
-      - name: Install Android SDK + Emulator (arm64 system image)
+      - name: Install Android SDK + Emulator (x86_64 system image)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           set -e
@@ -88,11 +84,11 @@ jobs:
             "platform-tools" \
             "emulator" \
             "platforms;android-${ANDROID_API_LEVEL}" \
-            "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
+            "system-images;android-${ANDROID_API_LEVEL};google_apis;x86_64" \
             "build-tools;${ANDROID_BUILD_TOOLS}"
           echo "SDK install completed"
 
-      - name: Create AVD
+      - name: Create AVD (x86_64)
         run: |
           set -e
           export ANDROID_HOME="$HOME/android-sdk"
@@ -102,10 +98,10 @@ jobs:
           export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator"
           echo "=== Available system images ==="
           sdkmanager --list_installed | grep -E "system-images|platforms|build-tools" || true
-          echo "=== Creating AVD ==="
+          echo "=== Creating AVD (x86_64) ==="
           echo "no" | avdmanager create avd \
             -n ${{ env.EMULATOR_NAME }} \
-            -k "system-images;android-${ANDROID_API_LEVEL};google_apis;arm64-v8a" \
+            -k "system-images;android-${ANDROID_API_LEVEL};google_apis;x86_64" \
             -d pixel_5 --force
           echo "=== AVD created. Listing AVDs: ==="
           avdmanager list avd | head -30
@@ -127,7 +123,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install frida frida-tools cryptography lief capstone pyyaml requests
 
-      - name: Boot emulator headless (QEMU TCG software emulation)
+      - name: Boot emulator headless (KVM accelerated x86_64)
         id: boot_emu
         continue-on-error: true
         run: |
@@ -137,14 +133,14 @@ jobs:
           grep -E "^(model name|flags)" /proc/cpuinfo | head -2
           echo "=== KVM availability ==="
           kvm-ok 2>/dev/null || echo "kvm-ok not available"
-          ls -la /dev/kvm 2>/dev/null || echo "(no /dev/kvm — required to use TCG fallback)"
+          ls -la /dev/kvm 2>/dev/null || echo "(no /dev/kvm — will fall back to TCG)"
           echo ""
-          echo "=== Starting arm64 emulator with TCG software emulation ==="
-          # On Linux x86_64, arm64 emulation uses QEMU TCG (software).
-          # -no-accel forces TCG, -no-metrics skips the metrics prompt
-          # Boot will take 10-15 min on TCG — be patient.
+          echo "=== Starting x86_64 emulator with KVM acceleration ==="
+          # KVM gives us near-native x86_64 execution.
+          # -accel auto tries KVM first, falls back to TCG if unavailable.
+          # -no-metrics skips the metrics prompt.
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
-            -no-accel -no-metrics \
+            -accel auto -no-metrics \
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -no-snapshot-save \
             -partition-size 2048 \
@@ -158,20 +154,20 @@ jobs:
             tail -100 ~/emulator.log
             exit 1
           fi
-          echo "Waiting for device (up to 10 min)..."
-          if ! timeout 600 adb wait-for-device; then
-            echo "ERROR: adb wait-for-device timed out after 10 min"
+          echo "Waiting for device (up to 5 min)..."
+          if ! timeout 300 adb wait-for-device; then
+            echo "ERROR: adb wait-for-device timed out after 5 min"
             tail -100 ~/emulator.log
             exit 1
           fi
-          echo "Device registered. Waiting for boot completion (up to 20 min)..."
-          if ! timeout 1200 bash -c '
+          echo "Device registered. Waiting for boot completion (up to 10 min)..."
+          if ! timeout 600 bash -c '
             while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do
-              sleep 10
+              sleep 5
               echo -n "."
             done
           '; then
-            echo "ERROR: boot completion timed out after 20 min"
+            echo "ERROR: boot completion timed out after 10 min"
             tail -100 ~/emulator.log
             adb shell getprop | head -50
             exit 1
@@ -195,30 +191,23 @@ jobs:
           ps aux | grep -E "emulator|adb|qemu" | grep -v grep || true
           exit 1
 
-      - name: Download Frida server (ARM64)
+      - name: Download Frida server (x86_64)
         run: |
           FRIDA_VER=$(python -c "import frida; print(frida.__version__)")
           echo "Frida version: $FRIDA_VER"
-          curl -L -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-server-${FRIDA_VER}-android-arm64.xz"
+          curl -L -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-server-${FRIDA_VER}-android-x86_64.xz"
           xz -d frida-server.xz
           mkdir -p ~/frida
-          mv frida-server ~/frida/frida-server-arm64
-          chmod +x ~/frida/frida-server-arm64
-
-      - name: Download Phantom Frida (ARM64)
-        run: |
-          curl -L -o ~/frida/phantom-frida-arm64 "${{ inputs.phantom_frida_url }}"
-          chmod +x ~/frida/phantom-frida-arm64
-          ls -la ~/frida/
+          mv frida-server ~/frida/frida-server-x86_64
+          chmod +x ~/frida/frida-server-x86_64
 
       - name: Start frida-server on emulator
         run: |
           adb root
           sleep 3
           adb wait-for-device
-          adb push ~/frida/frida-server-arm64 /data/local/tmp/frida-server
-          adb push ~/frida/phantom-frida-arm64 /data/local/tmp/phantom-frida
-          adb shell "chmod 755 /data/local/tmp/frida-server /data/local/tmp/phantom-frida"
+          adb push ~/frida/frida-server-x86_64 /data/local/tmp/frida-server
+          adb shell "chmod 755 /data/local/tmp/frida-server"
           adb shell "nohup /data/local/tmp/frida-server -D > /data/local/tmp/frida-server.log 2>&1 &"
           sleep 3
           adb shell "ps -A | grep frida"
