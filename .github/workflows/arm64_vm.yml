@@ -131,6 +131,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install frida frida-tools cryptography lief capstone pyyaml requests
 
+      - name: Fix KVM permissions
+        run: |
+          echo "=== Before fix ==="
+          ls -la /dev/kvm
+          id
+          # Try multiple approaches to grant KVM access
+          sudo chmod 666 /dev/kvm
+          echo "=== After chmod 666 ==="
+          ls -la /dev/kvm
+          # Also try adding to kvm group (may not take effect until next login,
+          # but we'll use sg/newgrp to work around that)
+          sudo gpasswd -a $USER kvm || true
+          # Verify we can actually open /dev/kvm
+          if [ -w /dev/kvm ]; then
+            echo "✓ /dev/kvm is writable by current user"
+          else
+            echo "✗ /dev/kvm is NOT writable — trying setfacl"
+            sudo apt-get install -y acl
+            sudo setfacl -m u:$USER:rw /dev/kvm
+            ls -la /dev/kvm
+            getfacl /dev/kvm
+          fi
+
       - name: Boot emulator headless (KVM accelerated x86_64)
         id: boot_emu
         continue-on-error: true
@@ -140,13 +163,17 @@ jobs:
           nproc
           grep -E "^(model name|flags)" /proc/cpuinfo | head -2
           echo "=== KVM availability ==="
-          kvm-ok 2>/dev/null || echo "kvm-ok not available"
-          ls -la /dev/kvm 2>/dev/null || echo "(no /dev/kvm — will fall back to TCG)"
+          ls -la /dev/kvm
+          if [ -w /dev/kvm ]; then
+            echo "✓ /dev/kvm is writable"
+          else
+            echo "✗ /dev/kvm is NOT writable — KVM will fail"
+          fi
           echo ""
           echo "=== Starting x86_64 emulator with KVM acceleration ==="
-          # KVM gives us near-native x86_64 execution.
-          # -accel auto tries KVM first, falls back to TCG if unavailable.
-          # -no-metrics skips the metrics prompt.
+          # Use -accel auto (tries KVM, falls back to TCG)
+          # If KVM permissions still fail, the emulator will exit and we'll
+          # see the error in emulator.log
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
             -accel auto -no-metrics \
             -no-window -no-audio -no-boot-anim -no-snapshot \
