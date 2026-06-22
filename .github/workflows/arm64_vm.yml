@@ -48,7 +48,7 @@ jobs:
           path: |
             ~/Library/Android/sdk
             ~/.android/avd
-          key: android-sdk-arm64-api30-v5
+          key: android-sdk-arm64-api30-v6
 
       - name: Install Android SDK + Emulator
         if: steps.cache-sdk.outputs.cache-hit != 'true'
@@ -91,25 +91,86 @@ jobs:
         run: brew install cloudflared
 
       - name: Boot emulator headless
+        id: boot_emu
+        continue-on-error: true
         run: |
           set -e
+          echo "=== Checking HVF availability ==="
+          # Try to detect if HVF is available; fall back to software emulation
+          # GitHub Actions macOS runners sometimes have HVF disabled
+          HVF_FLAG=""
+          if [ -e /dev/null ]; then
+            # Quick HVF probe: try a tiny HVF-using binary if available, else just default to no-accel
+            :
+          fi
+          # Default to -no-accel which forces TCG (software) emulation.
+          # This is slower (~5-10 min boot) but reliable across runner configs.
+          # If you know HVF is available on your runner, set USE_HVF=true below.
+          USE_HVF="${USE_HVF:-false}"
+          if [ "$USE_HVF" = "true" ]; then
+            HVF_FLAG="-accel hvf"
+            echo "Using HVF (hardware acceleration)"
+          else
+            HVF_FLAG="-no-accel -no-metrics"
+            echo "Using TCG (software emulation) — slower but reliable"
+          fi
+          echo "=== Starting emulator with: $HVF_FLAG ==="
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
+            $HVF_FLAG \
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -no-snapshot-save \
             -partition-size 2048 \
+            -wipe-data \
             > ~/emulator.log 2>&1 &
-          echo "Emulator PID: $!"
-          adb wait-for-device
-          echo "Waiting for boot completion (up to 5 min)..."
-          timeout 300 bash -c '
+          EMU_PID=$!
+          echo "Emulator PID: $EMU_PID"
+          # Wait for emulator process to start
+          sleep 5
+          if ! kill -0 $EMU_PID 2>/dev/null; then
+            echo "ERROR: emulator process died immediately"
+            tail -100 ~/emulator.log
+            exit 1
+          fi
+          # Wait for device with hard timeout (5 min) — fail fast instead of hanging
+          echo "Waiting for device (up to 5 min)..."
+          if ! timeout 300 adb wait-for-device; then
+            echo "ERROR: adb wait-for-device timed out after 5 min"
+            echo "=== emulator.log (last 100 lines) ==="
+            tail -100 ~/emulator.log
+            exit 1
+          fi
+          echo "Device registered with ADB. Waiting for boot completion (up to 10 min)..."
+          if ! timeout 600 bash -c '
             while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do
               sleep 5
+              echo -n "."
             done
-          '
+          '; then
+            echo "ERROR: boot completion timed out after 10 min"
+            echo "=== emulator.log (last 100 lines) ==="
+            tail -100 ~/emulator.log
+            echo "=== adb shell getprop ==="
+            adb shell getprop | head -50
+            exit 1
+          fi
+          echo ""
           echo "=== Boot completed ==="
           echo "ABI:        $(adb shell getprop ro.product.cpu.abi | tr -d "\r")"
           echo "API level:  $(adb shell getprop ro.build.version.sdk | tr -d "\r")"
           echo "Fingerprint: $(adb shell getprop ro.build.fingerprint | tr -d "\r")"
+
+      - name: Dump emulator log on failure
+        if: steps.boot_emu.outcome == 'failure'
+        run: |
+          echo "=== Boot failed. Full emulator.log: ==="
+          cat ~/emulator.log 2>/dev/null || echo "(no emulator.log)"
+          echo ""
+          echo "=== adb devices: ==="
+          adb devices || true
+          echo ""
+          echo "=== Running processes (emulator/adb): ==="
+          ps aux | grep -E "emulator|adb|qemu" | grep -v grep || true
+          exit 1
 
       - name: Download Frida server (ARM64)
         run: |
