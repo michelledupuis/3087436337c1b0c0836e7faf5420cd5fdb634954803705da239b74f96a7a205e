@@ -235,26 +235,101 @@ jobs:
           ps aux | grep -E "emulator|adb|qemu" | grep -v grep || true
           exit 1
 
-      - name: Download Frida server (x86_64)
+      - name: Download Phantom Frida server (x86_64) — anti-detection build
         run: |
-          FRIDA_VER=$(python -c "import frida; print(frida.__version__)")
-          echo "Frida version: $FRIDA_VER"
-          curl -L -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-server-${FRIDA_VER}-android-x86_64.xz"
-          xz -d frida-server.xz
-          mkdir -p ~/frida
-          mv frida-server ~/frida/frida-server-x86_64
-          chmod +x ~/frida/frida-server-x86_64
+          # Phantom Frida is the user's custom-built anti-detection Frida fork.
+          # It covers 16 detection vectors with ~90 patches (process name,
+          # libfrida-agent.so, thread names, memfd name, frida_agent_main symbol,
+          # SELinux labels, libc hooks, D-Bus service, default port, internal C
+          # symbols, GType names, temp paths, binary string residuals, build
+          # config defines, asset directory). The binary is built with
+          # --extended --temp-fixes for maximum stealth.
+          #
+          # This specific release uses:
+          #   custom_name = system_helper681 (replaces 'frida' everywhere)
+          #   port         = 37194 (built-in default, no flag needed)
+          #   arch         = android-x86_64
+          #   frida_version = 17.13.0 (matches frida-tools pip package)
+          #   extended     = true
+          #   temp_fixes   = true
+          #
+          # SHA256 of the .gz is verified against the official build-info.json
+          # published in the same release.
+          set -e
+          PHANTOM_TAG="v17.13.0-android-x86_64-20260617"
+          PHANTOM_GZ="system_helper681-server-17.13.0-android-x86_64.gz"
+          PHANTOM_BIN="system_helper681-server-17.13.0-android-x86_64"
+          EXPECTED_SHA256="84043d8b46043a69567312fd8d50a253bac78c9c42503ea70feac6137a333e4b"
+          echo "=== Fetching Phantom Frida build-info.json (verify SHA256) ==="
+          curl -fsSL -o /tmp/build-info.json \
+            "https://github.com/michelledupuis/phantom-frida/releases/download/${PHANTOM_TAG}/build-info.json"
+          cat /tmp/build-info.json
+          ACTUAL_SHA256=$(jq -r '.artifacts.server_gz.sha256' /tmp/build-info.json)
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "ERROR: SHA256 mismatch in build-info.json"
+            echo "  expected: $EXPECTED_SHA256"
+            echo "  actual:   $ACTUAL_SHA256"
+            exit 1
+          fi
+          echo "✓ build-info.json SHA256 verified: $ACTUAL_SHA256"
+          PORT_FROM_JSON=$(jq -r '.port' /tmp/build-info.json)
+          CUSTOM_NAME_FROM_JSON=$(jq -r '.custom_name' /tmp/build-info.json)
+          echo "Phantom Frida custom_name: $CUSTOM_NAME_FROM_JSON, port: $PORT_FROM_JSON"
+          if [ "$PORT_FROM_JSON" != "37194" ] || [ "$CUSTOM_NAME_FROM_JSON" != "system_helper681" ]; then
+            echo "ERROR: unexpected Phantom Frida build parameters"
+            exit 1
+          fi
+          echo "=== Downloading $PHANTOM_GZ (~44MB) ==="
+          mkdir -p ~/phantom-frida
+          cd ~/phantom-frida
+          curl -fsSL -o "$PHANTOM_GZ" \
+            "https://github.com/michelledupuis/phantom-frida/releases/download/${PHANTOM_TAG}/${PHANTOM_GZ}"
+          DOWNLOAD_SHA256=$(sha256sum "$PHANTOM_GZ" | awk '{print $1}')
+          if [ "$DOWNLOAD_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "ERROR: downloaded .gz SHA256 mismatch"
+            echo "  expected: $EXPECTED_SHA256"
+            echo "  actual:   $DOWNLOAD_SHA256"
+            exit 1
+          fi
+          echo "✓ downloaded .gz SHA256 verified: $DOWNLOAD_SHA256"
+          gunzip -k "$PHANTOM_GZ"
+          chmod +x "$PHANTOM_BIN"
+          ls -lh "$PHANTOM_BIN"
+          file "$PHANTOM_BIN" || true
+          # Persist parameters for subsequent steps
+          echo "37194" > ~/phantom-frida-port.txt
+          echo "system_helper681" > ~/phantom-frida-name.txt
 
-      - name: Start frida-server on emulator
+      - name: Start Phantom Frida server on emulator (port 37194)
         run: |
+          set -e
+          PHANTOM_BIN="system_helper681-server-17.13.0-android-x86_64"
+          PORT=$(cat ~/phantom-frida-port.txt)
+          NAME=$(cat ~/phantom-frida-name.txt)
+          echo "Phantom Frida name: $NAME, port: $PORT"
           adb root
           sleep 3
           adb wait-for-device
-          adb push ~/frida/frida-server-x86_64 /data/local/tmp/frida-server
-          adb shell "chmod 755 /data/local/tmp/frida-server"
-          adb shell "nohup /data/local/tmp/frida-server -D > /data/local/tmp/frida-server.log 2>&1 &"
-          sleep 3
-          adb shell "ps -A | grep frida"
+          # Push to /data/local/tmp/ — use a NON-'frida' filename (binary already
+          # uses system_helper681 as the internal name; we keep the filename
+          # consistent so detection vector #1 (process name) is fully obscured)
+          adb push ~/phantom-frida/$PHANTOM_BIN /data/local/tmp/${NAME}-server
+          adb shell "chmod 755 /data/local/tmp/${NAME}-server"
+          # Launch in daemon mode. Phantom Frida binary has port 37194 baked in
+          # as default (built via --port 37194), so no -l flag needed.
+          adb shell "nohup /data/local/tmp/${NAME}-server -D > /data/local/tmp/${NAME}-server.log 2>&1 &"
+          sleep 5
+          # Verify the server is actually running
+          echo "=== Processes matching ${NAME} on device ==="
+          adb shell "ps -A | grep -E '${NAME}|37194' || echo '(no match — checking all processes)' && ps -A | head -30"
+          echo "=== Setting up ADB port forward (PC tcp:37194 -> device tcp:37194) ==="
+          adb forward tcp:${PORT} tcp:${PORT}
+          adb forward --list
+          # Quick smoke test: frida-ps -H should list device processes
+          echo "=== frida-ps -H 127.0.0.1:${PORT} smoke test ==="
+          timeout 30 frida-ps -H 127.0.0.1:${PORT} 2>&1 | head -15 || echo "(frida-ps -H smoke test failed — server may still be starting)"
+          echo "=== ${NAME}-server.log (device) ==="
+          adb shell "cat /data/local/tmp/${NAME}-server.log 2>&1 | tail -30"
 
       - name: Install MCP server deps + generate token
         run: |
@@ -338,11 +413,13 @@ jobs:
           echo "Android API:    $(adb shell getprop ro.build.version.sdk | tr -d "\r")"
           echo "Fingerprint:    $(adb shell getprop ro.build.fingerprint | tr -d "\r")"
           echo ""
-          echo "Frida processes on device:"
-          adb shell "ps -A | grep frida"
+          echo "Phantom Frida processes on device:"
+          NAME=$(cat ~/phantom-frida-name.txt)
+          PORT=$(cat ~/phantom-frida-port.txt)
+          adb shell "ps -A | grep -E '${NAME}' || echo '(no ${NAME} processes — server died?)'"
           echo ""
-          echo "First 10 frida-ps -U entries:"
-          timeout 15 frida-ps -U 2>&1 | head -10 || echo "(frida-ps timed out or failed)"
+          echo "First 10 frida-ps -H 127.0.0.1:${PORT} entries:"
+          timeout 15 frida-ps -H 127.0.0.1:${PORT} 2>&1 | head -10 || echo "(frida-ps -H timed out or failed)"
           echo ""
           echo "VM will stay alive for ${{ inputs.session_minutes }} minutes."
 
@@ -363,6 +440,8 @@ jobs:
 
       - name: Keep VM alive (session loop)
         run: |
+          NAME=$(cat ~/phantom-frida-name.txt)
+          PORT=$(cat ~/phantom-frida-port.txt)
           END=$((SECONDS + ${{ inputs.session_minutes }} * 60))
           HEARTBEAT=0
           while [ $SECONDS -lt $END ]; do
@@ -371,10 +450,15 @@ jobs:
               echo "[$(date)] ADB lost! Reconnecting..."
               adb kill-server; sleep 2; adb start-server
               adb wait-for-device || break
+              # Re-establish port forward after ADB restart
+              adb forward tcp:${PORT} tcp:${PORT} || true
             fi
-            if ! adb shell "pgrep -f /data/local/tmp/frida-server" > /dev/null 2>&1; then
-              echo "[$(date)] frida-server died, restarting..."
-              adb shell "nohup /data/local/tmp/frida-server -D > /data/local/tmp/frida-server.log 2>&1 &"
+            # Check Phantom Frida server (renamed) is alive
+            if ! adb shell "pgrep -f /data/local/tmp/${NAME}-server" > /dev/null 2>&1; then
+              echo "[$(date)] ${NAME}-server died, restarting..."
+              adb shell "nohup /data/local/tmp/${NAME}-server -D > /data/local/tmp/${NAME}-server.log 2>&1 &"
+              sleep 3
+              adb forward tcp:${PORT} tcp:${PORT} || true
             fi
             if ! pgrep -f "dist/src/server.js" > /dev/null 2>&1; then
               echo "[$(date)] MCP server died, restarting..."
@@ -388,7 +472,7 @@ jobs:
               nohup cloudflared tunnel --url http://localhost:8808 >> ~/cloudflared.log 2>&1 &
             fi
             if [ $((HEARTBEAT % 10)) -eq 0 ]; then
-              echo "[$(date)] Heartbeat #$HEARTBEAT — VM still alive"
+              echo "[$(date)] Heartbeat #$HEARTBEAT — VM still alive (Phantom Frida on :${PORT})"
             fi
             sleep 60
           done
@@ -405,5 +489,7 @@ jobs:
             ~/cloudflared.log
             ~/tunnel-url.txt
             ~/mcp-token.txt
+            ~/phantom-frida-port.txt
+            ~/phantom-frida-name.txt
           if-no-files-found: ignore
           retention-days: 7
