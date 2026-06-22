@@ -1,8 +1,8 @@
-name: ARM64 Android VM (ubuntu-22.04-arm native)
+name: ARM64 Android VM (macOS-14 ARM64 + TCG)
 
 # =============================================================================
-# This workflow spins up a NATIVE ARM64 Android emulator on a GitHub Actions
-# ubuntu-22.04-arm (AWS Graviton) runner with KVM acceleration.
+# This workflow spins up an ARM64 Android emulator on a GitHub Actions
+# macOS-14 (Apple Silicon M1) runner using TCG software emulation.
 #
 # WHY ARM64 NATIVE (not ubuntu x86_64):
 #   - All our prior RE artifacts are ARM64:
@@ -16,16 +16,22 @@ name: ARM64 Android VM (ubuntu-22.04-arm native)
 #     This is the FUNDAMENTAL blocker on x86_64 that no amount of Frida hooking
 #     can fix (overwriting r_brk in linker causes #UD because 0xD6 is invalid
 #     in x86_64 long mode).
-#   - On ARM64 Linux, there is NO CPUID instruction -> no "KVMKVMKVM" CPUID
-#     signature -> DexProtector's check 0x0d (CPUID hypervisor detection) PASSES
-#     by default. QEMU/goldfish properties can be spoofed via Frida hooks.
-#   - We tried macOS-14 first (Hypervisor.framework) but GHA macOS runners
-#     don't expose HVF to nested virtualization (HVF error: HV_UNSUPPORTED).
-#   - ubuntu-22.04-arm exposes /dev/kvm natively (AWS Graviton), so the
-#     ARM64 Android emulator boots fast with KVM acceleration.
-#   - Net result: VM produces correct ARM64 outer key -> DPLF decrypts -> inner
-#     libdp.so loads -> HMAC wrapper is hookable -> password captured ->
-#     master_key computed -> classes.ecobank.dat decrypted.
+#   - On ARM64, there is NO CPUID instruction -> no "KVMKVMKVM" CPUID
+#     signature -> DexProtector's check 0x0d (CPUID hypervisor detection) PASSES.
+#
+# WHY TCG (not HVF):
+#   - GHA macOS-14 runners don't expose Hypervisor.framework (HVF) to nested
+#     virtualization (HVF error: HV_UNSUPPORTED).
+#   - ubuntu-22.04-arm runners expose /dev/kvm but sdkmanager doesn't ship the
+#     `emulator` package for linux-arm64 (Warning: Failed to find package 'emulator').
+#   - TCG (Tiny Code Generator) is QEMU's software emulation. On macOS-14 ARM64
+#     host running an ARM64 guest, TCG is same-arch emulation — reasonably fast
+#     (Android boots in ~15-20 min vs ~3-5 min with HVF). We increase the boot
+#     timeout to 25 min to accommodate.
+#
+# Net result: VM produces correct ARM64 outer key -> DPLF decrypts -> inner
+# libdp.so loads -> HMAC wrapper is hookable -> password captured ->
+# master_key computed -> classes.ecobank.dat decrypted.
 # =============================================================================
 
 on:
@@ -44,7 +50,7 @@ on:
 # We use 330 to leave buffer for teardown + artifact upload.
 jobs:
   arm64_vm:
-    runs-on: ubuntu-22.04-arm
+    runs-on: macos-14
     timeout-minutes: 350
     env:
       ANDROID_API_LEVEL: 30
@@ -73,31 +79,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Linux deps (KVM, cloudflared, etc.)
+      - name: Install Cloudflared (via Homebrew)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-arm \
-            qemu-utils \
-            bridge-utils \
-            libpulse0 \
-            libnss3 \
-            libxss1 \
-            libasound2 \
-            libgl1 \
-            libxshmfence1 \
-            cpu-checker \
-            android-tools-adb \
-            wget
-          # Grant KVM access to the runner user
-          sudo gpasswd -a $USER kvm || true
-          sudo chmod 666 /dev/kvm 2>/dev/null || true
-          kvm-ok 2>/dev/null || echo "kvm-ok not available"
-          ls -la /dev/kvm 2>/dev/null || echo "(no /dev/kvm)"
-          # Install cloudflared (arm64)
-          curl -L -o /tmp/cloudflared.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb
-          sudo dpkg -i /tmp/cloudflared.deb
+          brew install cloudflared
           cloudflared --version
 
       # ---------------------------------------------------------------------------
@@ -108,23 +92,22 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/android-sdk
+            ~/Library/Android/sdk
             ~/.android/avd
-          key: android-sdk-arm64-linux-api30-v1
+          key: android-sdk-arm64-macos-tcg-api30-v1
 
       - name: Install Android SDK + Emulator (ARM64 system image)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           set -e
-          SDK_ROOT=~/android-sdk
+          SDK_ROOT=~/Library/Android/sdk
           mkdir -p "$SDK_ROOT/cmdline-tools"
           cd "$SDK_ROOT/cmdline-tools"
-          curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
           unzip -q cmdline-tools.zip
           mv cmdline-tools latest
           cd "$SDK_ROOT"
           export ANDROID_HOME="$SDK_ROOT"
-          export ANDROID_SDK_ROOT="$SDK_ROOT"
           export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install \
@@ -140,12 +123,12 @@ jobs:
 
       - name: Add Android SDK to PATH
         run: |
-          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
-          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/Library/Android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/platform-tools" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/emulator" >> $GITHUB_PATH
+          echo "$HOME/Library/Android/sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
+          echo "ANDROID_HOME=$HOME/Library/Android/sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/Library/Android/sdk" >> $GITHUB_ENV
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
 
       - name: Install Python deps
@@ -157,45 +140,22 @@ jobs:
       # ---------------------------------------------------------------------------
       # Boot emulator headless using Apple's Hypervisor.framework (native ARM64)
       # ---------------------------------------------------------------------------
-      - name: Fix KVM permissions
-        run: |
-          echo "=== Before fix ==="
-          ls -la /dev/kvm
-          id
-          sudo chmod 666 /dev/kvm
-          echo "=== After chmod 666 ==="
-          ls -la /dev/kvm
-          sudo gpasswd -a $USER kvm || true
-          if [ -w /dev/kvm ]; then
-            echo "✓ /dev/kvm is writable by current user"
-          else
-            echo "✗ /dev/kvm is NOT writable — trying setfacl"
-            sudo apt-get install -y acl
-            sudo setfacl -m u:$USER:rw /dev/kvm
-            ls -la /dev/kvm
-            getfacl /dev/kvm
-          fi
-
-      - name: Boot emulator headless (native ARM64 via KVM)
+      - name: Boot emulator headless (ARM64 TCG software emulation)
         id: boot_emu
         continue-on-error: true
         run: |
           set -e
           echo "=== Architecture check ==="
-          uname -m  # should be aarch64
-          echo "=== KVM availability ==="
-          ls -la /dev/kvm
-          if [ -w /dev/kvm ]; then
-            echo "✓ /dev/kvm is writable"
-          else
-            echo "✗ /dev/kvm is NOT writable — KVM will fail"
-          fi
+          uname -m  # should be arm64
           echo "=== AVD config ==="
           cat ~/.android/avd/${{ env.EMULATOR_NAME }}.ini 2>/dev/null || true
           cat ~/.android/avd/${{ env.EMULATOR_NAME }}.avd/config.ini 2>/dev/null | head -30 || true
-          echo "=== Starting ARM64 emulator with KVM acceleration ==="
+          echo "=== Starting ARM64 emulator with TCG (software emulation) ==="
+          echo "(HVF is unavailable on GHA macOS runners; TCG is same-arch ARM64->ARM64, ~15-20 min boot)"
+          # Force TCG acceleration. -no-accel is too aggressive (disables all);
+          # -accel tcg forces QEMU TCG backend.
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
-            -accel auto -no-metrics \
+            -accel tcg -no-metrics \
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -no-snapshot-save \
             -partition-size 2048 \
@@ -209,26 +169,20 @@ jobs:
             tail -100 ~/emulator.log
             exit 1
           fi
-          if [ ! -w /dev/kvm ]; then
-            echo "ERROR: /dev/kvm is not writable — KVM acceleration unavailable."
-            echo "Cannot boot ARM64 Android emulator without KVM in under 10 min."
-            ls -la /dev/kvm 2>/dev/null || true
-            exit 1
-          fi
-          echo "Waiting for device (up to 5 min)..."
-          if ! timeout 300 adb wait-for-device; then
-            echo "ERROR: adb wait-for-device timed out after 5 min"
+          echo "Waiting for device (up to 10 min)..."
+          if ! timeout 600 adb wait-for-device; then
+            echo "ERROR: adb wait-for-device timed out after 10 min"
             tail -100 ~/emulator.log
             exit 1
           fi
-          echo "Device registered. Waiting for boot completion (up to 10 min)..."
-          if ! timeout 600 bash -c '
+          echo "Device registered. Waiting for boot completion (up to 25 min)..."
+          if ! timeout 1500 bash -c '
             while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do
-              sleep 5
+              sleep 10
               echo -n "."
             done
           '; then
-            echo "ERROR: boot completion timed out after 10 min"
+            echo "ERROR: boot completion timed out after 25 min"
             tail -100 ~/emulator.log
             adb shell getprop | head -50
             exit 1
