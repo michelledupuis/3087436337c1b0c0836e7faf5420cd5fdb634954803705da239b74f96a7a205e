@@ -14,7 +14,7 @@ on:
 
 jobs:
   arm64_vm:
-    runs-on: macos-14
+    runs-on: ubuntu-22.04
     timeout-minutes: 350
     env:
       ANDROID_API_LEVEL: 30
@@ -41,23 +41,44 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Linux deps (QEMU, cloudflared, etc.)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-arm \
+            qemu-utils \
+            qemu-user-static \
+            bridge-utils \
+            libpulse0 \
+            libnss3 \
+            libxss1 \
+            libasound2 \
+            libgl1 \
+            libxshmfence1 \
+            cpu-checker
+          # Install cloudflared directly (no brew on Linux)
+          curl -L -o /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared --version
+
       - name: Cache Android SDK + AVD
         id: cache-sdk
         uses: actions/cache@v4
         with:
           path: |
-            ~/Library/Android/sdk
+            ~/android-sdk
             ~/.android/avd
-          key: android-sdk-arm64-api30-v6
+          key: android-sdk-arm64-linux-api30-v1
 
-      - name: Install Android SDK + Emulator
+      - name: Install Android SDK + Emulator (arm64 system image)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           set -e
-          SDK_ROOT=~/Library/Android/sdk
+          SDK_ROOT=~/android-sdk
           mkdir -p "$SDK_ROOT/cmdline-tools"
           cd "$SDK_ROOT/cmdline-tools"
-          curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
+          curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q cmdline-tools.zip
           mv cmdline-tools latest
           export ANDROID_HOME="$SDK_ROOT"
@@ -76,47 +97,35 @@ jobs:
 
       - name: Add SDK to PATH
         run: |
-          echo "$HOME/Library/Android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$HOME/Library/Android/sdk/platform-tools" >> $GITHUB_PATH
-          echo "$HOME/Library/Android/sdk/emulator" >> $GITHUB_PATH
-          echo "$HOME/Library/Android/sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
-          echo "ANDROID_HOME=$HOME/Library/Android/sdk" >> $GITHUB_ENV
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install frida frida-tools cryptography lief capstone pyyaml requests
 
-      - name: Install cloudflared
-        run: brew install cloudflared
-
-      - name: Boot emulator headless
+      - name: Boot emulator headless (QEMU TCG software emulation)
         id: boot_emu
         continue-on-error: true
         run: |
           set -e
-          echo "=== Checking HVF availability ==="
-          # Try to detect if HVF is available; fall back to software emulation
-          # GitHub Actions macOS runners sometimes have HVF disabled
-          HVF_FLAG=""
-          if [ -e /dev/null ]; then
-            # Quick HVF probe: try a tiny HVF-using binary if available, else just default to no-accel
-            :
-          fi
-          # Default to -no-accel which forces TCG (software) emulation.
-          # This is slower (~5-10 min boot) but reliable across runner configs.
-          # If you know HVF is available on your runner, set USE_HVF=true below.
-          USE_HVF="${USE_HVF:-false}"
-          if [ "$USE_HVF" = "true" ]; then
-            HVF_FLAG="-accel hvf"
-            echo "Using HVF (hardware acceleration)"
-          else
-            HVF_FLAG="-no-accel -no-metrics"
-            echo "Using TCG (software emulation) — slower but reliable"
-          fi
-          echo "=== Starting emulator with: $HVF_FLAG ==="
+          echo "=== CPU info ==="
+          nproc
+          grep -E "^(model name|flags)" /proc/cpuinfo | head -2
+          echo "=== KVM availability ==="
+          kvm-ok 2>/dev/null || echo "kvm-ok not available"
+          ls -la /dev/kvm 2>/dev/null || echo "(no /dev/kvm — required to use TCG fallback)"
+          echo ""
+          echo "=== Starting arm64 emulator with TCG software emulation ==="
+          # On Linux x86_64, arm64 emulation uses QEMU TCG (software).
+          # -no-accel forces TCG, -no-metrics skips the metrics prompt
+          # Boot will take 10-15 min on TCG — be patient.
           nohup emulator -avd ${{ env.EMULATOR_NAME }} \
-            $HVF_FLAG \
+            -no-accel -no-metrics \
             -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -no-snapshot-save \
             -partition-size 2048 \
@@ -124,32 +133,27 @@ jobs:
             > ~/emulator.log 2>&1 &
           EMU_PID=$!
           echo "Emulator PID: $EMU_PID"
-          # Wait for emulator process to start
           sleep 5
           if ! kill -0 $EMU_PID 2>/dev/null; then
             echo "ERROR: emulator process died immediately"
             tail -100 ~/emulator.log
             exit 1
           fi
-          # Wait for device with hard timeout (5 min) — fail fast instead of hanging
-          echo "Waiting for device (up to 5 min)..."
-          if ! timeout 300 adb wait-for-device; then
-            echo "ERROR: adb wait-for-device timed out after 5 min"
-            echo "=== emulator.log (last 100 lines) ==="
+          echo "Waiting for device (up to 10 min)..."
+          if ! timeout 600 adb wait-for-device; then
+            echo "ERROR: adb wait-for-device timed out after 10 min"
             tail -100 ~/emulator.log
             exit 1
           fi
-          echo "Device registered with ADB. Waiting for boot completion (up to 10 min)..."
-          if ! timeout 600 bash -c '
+          echo "Device registered. Waiting for boot completion (up to 20 min)..."
+          if ! timeout 1200 bash -c '
             while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do
-              sleep 5
+              sleep 10
               echo -n "."
             done
           '; then
-            echo "ERROR: boot completion timed out after 10 min"
-            echo "=== emulator.log (last 100 lines) ==="
+            echo "ERROR: boot completion timed out after 20 min"
             tail -100 ~/emulator.log
-            echo "=== adb shell getprop ==="
             adb shell getprop | head -50
             exit 1
           fi
@@ -168,7 +172,7 @@ jobs:
           echo "=== adb devices: ==="
           adb devices || true
           echo ""
-          echo "=== Running processes (emulator/adb): ==="
+          echo "=== Running processes (emulator/adb/qemu): ==="
           ps aux | grep -E "emulator|adb|qemu" | grep -v grep || true
           exit 1
 
